@@ -16,6 +16,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <iostream>
+#include <fstream>
+
 struct Config
 {
     int socketFd;
@@ -28,6 +31,7 @@ struct Config
 
 bool setUidGid(const struct Config *config)
 {
+    close(config->other);
     std::cout << "trying a user namespace..." << std::endl;
 
     int has_userns = !unshare(CLONE_NEWUSER);
@@ -49,26 +53,31 @@ bool setUidGid(const struct Config *config)
     {
         std::cout << "read some" << std::endl;
     }
+
     if (result != 1)
     {
         return false;
     }
-    if (has_userns) {
-        fprintf(stderr, "done.\n");
-    } else {
-        fprintf(stderr, "unsupported? continuing.\n");
+
+    close(config->socketFd);
+
+    if (!has_userns)
+    {
+        std::cerr << "Config uid/gid is unsupported?" << std::endl;
     }
-    fprintf(stderr, "=> switching to uid %d / gid %d...", config->uid, config->uid);
+
+    std::cerr << "Switching to uid " << config->uid << " / gid " << config->uid << "..." << std::endl;
 
     gid_t gid{ config->uid };
     if (setgroups(1, &gid) ||
         setresgid(config->uid, config->uid, config->uid) ||
-        setresuid(config->uid, config->uid, config->uid)) {
-        fprintf(stderr, "%m\n");
+        setresuid(config->uid, config->uid, config->uid))
+    {
+        std::cerr << "Child process failed to config uid/gid." << std::endl;
         return false;
     }
-    fprintf(stderr, "done.\n");
-    //return 0;
+
+    std::cout << "Uid/gid config done.";
     return true;
 
 
@@ -76,7 +85,6 @@ bool setUidGid(const struct Config *config)
 
 bool setChildProcessUidMap(pid_t childPid, int socketFd)
 {
-    int uid_map = 0;
     int has_userns = -1;
     std::cout << "parent set uid" << std::endl;
 
@@ -94,31 +102,28 @@ bool setChildProcessUidMap(pid_t childPid, int socketFd)
         std::cout << "Read: " << has_userns << std::endl;
 
     }
-    if (has_userns) {
 
-#define PATH_MAX 256
+    if (has_userns)
+    {
+        std::ofstream uidOutput;
+        std::ofstream gidOutput;
 
-        char path[PATH_MAX] = {0};
-         char *filename[]{ "uid_map", "gid_map", nullptr };
-        for (char **file =filename; *file; file++) {
-            if (snprintf(path, sizeof(path), "/proc/%d/%s", childPid, *file)
-                > sizeof(path)) {
-                fprintf(stderr, "snprintf too big? %m\n");
-                return -1;
-            }
-            fprintf(stderr, "writing %s...", path);
-            if ((uid_map = open(path, O_WRONLY)) == -1) {
-                fprintf(stderr, "open failed: %m\n");
-                return -1;
-            }
-            if (dprintf(uid_map, "0 %d %d\n", USERNS_OFFSET, USERNS_COUNT) == -1) {
-                fprintf(stderr, "dprintf failed: %m\n");
-                close(uid_map);
-                return -1;
-            }
-            close(uid_map);
+        try
+        {
+            uidOutput.open(std::string{"/proc/"} + std::to_string(childPid) + "/uid_map");
+            uidOutput << "0 " << USERNS_OFFSET << " " << USERNS_COUNT << std::endl;
+            gidOutput.open(std::string{"/proc/"} + std::to_string(childPid) + "/gid_map");
+            gidOutput << "0 " << USERNS_OFFSET << " " << USERNS_COUNT << std::endl;
         }
+        catch (std::ifstream::failure e)
+        {
+            std::cout << "Unable to config the uid/gid files." << std::endl;
+        }
+
+        uidOutput.close();
+        gidOutput.close();
     }
+
     int dummy = 1;
     std::cout << "set uid" << std::endl;
     if (write(socketFd, &dummy, sizeof(dummy)) != sizeof(dummy))
@@ -164,7 +169,7 @@ int child(void *arg)
         std::cerr << "Unable to set Hostname." << std::endl;
         return -1;
     }
-    close(config->other);
+
 
     if (!setUidGid(config))
     {
