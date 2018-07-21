@@ -2,9 +2,9 @@
 #include <vector>
 #include <string>
 #include <sys/utsname.h>
-#ifndef _GNU_SOURCE
+//#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
-#endif
+//#endif
 #include <sched.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
@@ -18,13 +18,31 @@
 #include <grp.h>
 #include <iostream>
 #include <fstream>
-
+#include <sys/mount.h>
+#include <linux/unistd.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <errno.h>
+#include <stdio.h>
+#include <sched.h>
+#include <stdlib.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 struct Config
 {
     int socketFd;
     int other;
     uid_t uid;
+    std::string root;
+    std::string command;
 };
+
+int pivot_root(const char *new_root, const char *put_old)
+{
+    return syscall(SYS_pivot_root, new_root, put_old);
+}
 
 #define USERNS_OFFSET 10000
 #define USERNS_COUNT 2000
@@ -79,8 +97,6 @@ bool setUidGid(const struct Config *config)
 
     std::cout << "Uid/gid config done.";
     return true;
-
-
 }
 
 bool setChildProcessUidMap(pid_t childPid, int socketFd)
@@ -138,6 +154,65 @@ bool setChildProcessUidMap(pid_t childPid, int socketFd)
     return true;
 }
 
+bool mount(const struct Config *config)
+{
+    fprintf(stderr, "=> remounting everything with MS_PRIVATE...");
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
+        fprintf(stderr, "failed! %m\n");
+        return false;
+    }
+    fprintf(stderr, "remounted.\n");
+
+    fprintf(stderr, "=> making a temp directory and a bind mount there...");
+    char mount_dir[] = "/tmp/tmp.XXXXXX";
+    if (!mkdtemp(mount_dir)) {
+        fprintf(stderr, "failed making a directory!\n");
+        return false;
+    }
+
+    if (mount(config->root.c_str(), mount_dir, NULL, MS_BIND | MS_PRIVATE, NULL))
+    {
+        fprintf(stderr, "bind mount failed!\n");
+        return false;
+    }
+
+    char inner_mount_dir[] = "/tmp/tmp.XXXXXX/oldroot.XXXXXX";
+    memcpy(inner_mount_dir, mount_dir, sizeof(mount_dir) - 1);
+    if (!mkdtemp(inner_mount_dir))
+    {
+        fprintf(stderr, "failed making the inner directory!\n");
+        return false;
+    }
+    fprintf(stderr, "done.\n");
+
+    fprintf(stderr, "=> pivoting root...");
+    if (pivot_root(mount_dir, inner_mount_dir)) {
+        fprintf(stderr, "failed!\n");
+        return false;
+    }
+    fprintf(stderr, "done.\n");
+
+    char *old_root_dir = basename(inner_mount_dir);
+    char old_root[sizeof(inner_mount_dir) + 1] = { "/" };
+    strcpy(&old_root[1], old_root_dir);
+
+    fprintf(stderr, "=> unmounting %s...", old_root);
+    if (chdir("/")) {
+        fprintf(stderr, "chdir failed! %m\n");
+        return false;
+    }
+    if (umount2(old_root, MNT_DETACH)) {
+        fprintf(stderr, "umount failed! %m\n");
+        return false;
+    }
+    if (rmdir(old_root)) {
+        fprintf(stderr, "rmdir failed! %m\n");
+        return false;
+    }
+    fprintf(stderr, "done.\n");
+    return true;
+}
+
 int child(void *arg)
 {
     /*struct child_config *config = arg;
@@ -170,6 +245,11 @@ int child(void *arg)
         return -1;
     }
 
+    if (!mount(config))
+    {
+        std::cerr << "Unable to mount rootfs." << std::endl;
+        return -1;
+    }
 
     if (!setUidGid(config))
     {
@@ -177,7 +257,8 @@ int child(void *arg)
         return -1;
     }
 
-    char * const argv[]{"/home/shiy/debug.sh", nullptr};
+    char * const cmd =(char*) config->command.c_str();
+    char * const argv[]{cmd, nullptr};
 
     if (execve(argv[0], argv, nullptr) == -1)
     {
@@ -317,6 +398,9 @@ int main(int argc, char *argv[])
     config.socketFd = sockets[0];
     config.other = sockets[1];
     config.uid = 256;
+    config.root = rootfs;
+    config.command = commandLine;
+
     std::cout << "socket" << config.socketFd << config.other << std::endl;
 
     if ((childPid = clone(child, stack + STACK_SIZE, flags | SIGCHLD, &config)) == -1)
