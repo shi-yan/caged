@@ -42,6 +42,9 @@ struct Config
     uid_t uid;
     std::string root;
     std::string command;
+    std::string output;
+
+    bool hasOutput;
 };
 
 int pivot_root(const char *new_root, const char *put_old)
@@ -162,21 +165,21 @@ bool setChildProcessUidMap(pid_t childPid, int socketFd)
 
 bool mount(const struct Config *config)
 {
-    fprintf(stderr, "=> remounting everything with MS_PRIVATE...");
+    fprintf(stderr, "=> remounting everything with MS_PRIVATE...\n");
     if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
         fprintf(stderr, "failed! %m\n");
         return false;
     }
     fprintf(stderr, "remounted.\n");
 
-    fprintf(stderr, "=> making a temp directory and a bind mount there...");
+    fprintf(stderr, "=> making a temp directory and a bind mount there...\n");
     char mount_dir[] = "/tmp/tmp.XXXXXX";
     if (!mkdtemp(mount_dir)) {
         fprintf(stderr, "failed making a directory!\n");
         return false;
     }
 
-    if (mount(config->root.c_str(), mount_dir, NULL, MS_BIND | MS_PRIVATE, NULL))
+    if (mount(config->root.c_str(), mount_dir, NULL, MS_BIND | MS_PRIVATE | MS_RDONLY, NULL))
     {
         fprintf(stderr, "bind mount failed!\n");
         return false;
@@ -189,7 +192,35 @@ bool mount(const struct Config *config)
         fprintf(stderr, "failed making the inner directory!\n");
         return false;
     }
-    fprintf(stderr, "done.\n");
+
+    if (config->hasOutput)
+    {
+        fprintf(stderr, "=> making a temp build directory and a bind mount there...\n");
+
+        std::string outputMountFolder = mount_dir;
+        outputMountFolder.append(config->output);
+
+        if (mkdir(outputMountFolder.c_str(), ACCESSPERMS))
+        {
+            if (errno != EEXIST)
+            {
+                fprintf(stderr, "failed making the inner build directory! %s\n", strerror(errno));
+                return false;
+            }
+        }
+
+        if (mount(config->output.c_str(), outputMountFolder.c_str(), NULL, MS_BIND | MS_PRIVATE , NULL))
+        {
+            fprintf(stderr, "bind mount build folder failed! (%s, %s)\n", strerror(errno), outputMountFolder.c_str());
+            return false;
+        }
+
+        if (chmod( outputMountFolder.c_str(), ACCESSPERMS))
+        {
+            fprintf(stderr, "failed to change the permission of the build directory! %s\n", strerror(errno));
+            return false;
+        }
+    }
 
     fprintf(stderr, "=> pivoting root...");
     if (pivot_root(mount_dir, inner_mount_dir)) {
@@ -379,10 +410,14 @@ int main(int argc, char *argv[])
 
     options.add_options()
       ("c,command", "Command to Run", cxxopts::value<std::string>())
-      ("r,root", "Root Filesystem", cxxopts::value<std::string>());
+      ("r,root", "Root Filesystem", cxxopts::value<std::string>())
+      ("o,output", "Output Folder", cxxopts::value<std::string>());
 
     std::string rootfs;
     std::string commandLine;
+    std::string outputFolder;
+    struct Config config;
+    config.hasOutput = false;
 
     try
     {
@@ -408,6 +443,13 @@ int main(int argc, char *argv[])
         {
             commandLine = result["command"].as<std::string>();
             std::cout << "Commandline: " << commandLine << std::endl;
+        }
+
+        if (result["output"].count())
+        {
+            config.hasOutput = true;
+            outputFolder = result["output"].as<std::string>();
+            std::cout << "Output:" << outputFolder << std::endl;
         }
     }
     catch(const cxxopts::option_not_exists_exception &e)
@@ -489,9 +531,6 @@ int main(int argc, char *argv[])
 
     int sockets[2]{0};
 
-    struct Config config;
-
-
     if (socketpair(AF_LOCAL, SOCK_SEQPACKET, 0, sockets) == -1) {
         std::cerr << "Failed to Create Socket Pair to Communicate With the Child Process: " << errno << std::endl;
         return 1;
@@ -504,6 +543,7 @@ int main(int argc, char *argv[])
     config.uid = 256;
     config.root = rootfs;
     config.command = commandLine;
+    config.output = outputFolder;
 
     std::cout << "socket" << config.socketFd << config.other << std::endl;
 
